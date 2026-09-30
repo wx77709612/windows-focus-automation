@@ -89,7 +89,7 @@ function New-FocusSessionUri {
     )
 
     $endTimeMilliseconds = ([DateTimeOffset]$EndTime).ToUnixTimeMilliseconds()
-    return "ms-clock://createfocustimer?skipBreaks=false&displayMode=aot&force=true&endTime=$endTimeMilliseconds"
+    return "ms-clock://createfocustimer?skipBreaks=true&displayMode=aot&force=true&endTime=$endTimeMilliseconds"
 }
 
 function Start-NativeFocusSession {
@@ -383,6 +383,78 @@ function Wait-FocusSessionActive {
     return $false
 }
 
+function Maintain-FocusSession {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Afternoon', 'Evening', 'Test')]
+        [string]$Window,
+
+        [Parameter(Mandatory = $true)]
+        [datetime]$EndTime,
+
+        [string]$LogDirectory = $script:DefaultLogDirectory,
+
+        [TimeSpan]$PollInterval = ([TimeSpan]::FromSeconds(30)),
+
+        [scriptblock]$GetCurrentTime = { Get-Date }
+    )
+
+    $currentTime = & $GetCurrentTime
+    while ($currentTime -lt $EndTime) {
+        if (-not (Test-FocusSessionActive)) {
+            Write-FocusLog -Level WARN -Event 'FocusLost' -Data @{
+                Window  = $Window
+                EndTime = $EndTime.ToString('o')
+            } -Now $currentTime -LogDirectory $LogDirectory
+
+            $restart = Start-NativeFocusSession -EndTime $EndTime
+            if (-not $restart.Started -and $restart.Reason -ne 'FocusAlreadyActive') {
+                Write-FocusLog -Level ERROR -Event 'FocusRestartFailed' -Data @{
+                    Window = $Window
+                    Reason = $restart.Reason
+                } -Now $currentTime -LogDirectory $LogDirectory
+                return 11
+            }
+
+            if ($restart.Started -and -not (Wait-FocusSessionActive)) {
+                Write-FocusLog -Level ERROR -Event 'FocusRestartVerificationFailed' -Data @{
+                    Window = $Window
+                    Uri    = $restart.Uri
+                } -Now $currentTime -LogDirectory $LogDirectory
+                return 11
+            }
+
+            if (-not (Ensure-DoNotDisturbOff)) {
+                Write-FocusLog -Level ERROR -Event 'DoNotDisturbDisableFailed' -Data @{ Window = $Window } -Now $currentTime -LogDirectory $LogDirectory
+                return 12
+            }
+
+            Write-FocusLog -Level INFO -Event 'FocusRestarted' -Data @{
+                Window  = $Window
+                EndTime = $EndTime.ToString('o')
+            } -Now $currentTime -LogDirectory $LogDirectory
+        }
+        elseif (-not (Ensure-DoNotDisturbOff)) {
+            Write-FocusLog -Level ERROR -Event 'DoNotDisturbDisableFailed' -Data @{ Window = $Window } -Now $currentTime -LogDirectory $LogDirectory
+            return 12
+        }
+
+        $remaining = $EndTime - $currentTime
+        $sleepMilliseconds = [Math]::Min($PollInterval.TotalMilliseconds, $remaining.TotalMilliseconds)
+        if ($sleepMilliseconds -gt 0) {
+            Start-Sleep -Milliseconds ([Math]::Max(1, [int]$sleepMilliseconds))
+        }
+        $currentTime = & $GetCurrentTime
+    }
+
+    Write-FocusLog -Level INFO -Event 'FocusCompleted' -Data @{
+        Window  = $Window
+        EndTime = $EndTime.ToString('o')
+    } -Now $currentTime -LogDirectory $LogDirectory
+    return 0
+}
+
 function Invoke-FocusRun {
     [CmdletBinding()]
     param(
@@ -427,16 +499,13 @@ function Invoke-FocusRun {
 
         $launch = Start-NativeFocusSession -EndTime $decision.EndTime
         if (-not $launch.Started) {
-            if ($launch.Reason -eq 'FocusAlreadyActive') {
-                Write-FocusLog -Level INFO -Event 'FocusSkipped' -Data @{ Window = $Window; Reason = $launch.Reason } -Now $Now -LogDirectory $LogDirectory
-                return 0
+            if ($launch.Reason -ne 'FocusAlreadyActive') {
+                Write-FocusLog -Level ERROR -Event 'FocusLaunchFailed' -Data @{ Window = $Window; Reason = $launch.Reason } -Now $Now -LogDirectory $LogDirectory
+                return 11
             }
-
-            Write-FocusLog -Level ERROR -Event 'FocusLaunchFailed' -Data @{ Window = $Window; Reason = $launch.Reason } -Now $Now -LogDirectory $LogDirectory
-            return 11
         }
 
-        if (-not (Wait-FocusSessionActive)) {
+        if ($launch.Started -and -not (Wait-FocusSessionActive)) {
             Write-FocusLog -Level ERROR -Event 'FocusVerificationFailed' -Data @{ Window = $Window; Uri = $launch.Uri } -Now $Now -LogDirectory $LogDirectory
             return 11
         }
@@ -452,7 +521,7 @@ function Invoke-FocusRun {
             EndTime = $decision.EndTime.ToString('o')
             DndOff  = $true
         } -Now $Now -LogDirectory $LogDirectory
-        return 0
+        return Maintain-FocusSession -Window $Window -EndTime $decision.EndTime -LogDirectory $LogDirectory
     }
     catch {
         try {
@@ -522,12 +591,15 @@ function Register-FocusScheduledTasks {
                 $resolvedScriptPath.Replace('"', '""'), $definition.Window
             $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument
             $triggerTime = (Get-Date).Date.Add($definition.At)
-            $trigger = New-ScheduledTaskTrigger -Daily -At $triggerTime
+            $dailyTrigger = New-ScheduledTaskTrigger -Daily -At $triggerTime
+            $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+            $triggers = @($dailyTrigger, $logonTrigger)
             $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun:$false -MultipleInstances IgnoreNew
-            $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
+            $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Limited
 
             Register-ScheduledTask -TaskPath $script:FocusTaskPath -TaskName $definition.TaskName `
-                -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
+                -Action $action -Trigger $triggers -Settings $settings -Principal $principal `
                 -Description '按固定结束时间自动开启 Windows 专注，并保持勿扰关闭。' -Force -ErrorAction Stop | Out-Null
             $registered.Add($definition.TaskName)
         }
@@ -630,7 +702,7 @@ function Invoke-FocusCompatibilityTest {
             DndOff       = $true
             EndTime      = $endTime.ToString('o')
         } -Now $Now -LogDirectory $LogDirectory
-        return 0
+        return Maintain-FocusSession -Window Test -EndTime $endTime -LogDirectory $LogDirectory
     }
     catch {
         try {

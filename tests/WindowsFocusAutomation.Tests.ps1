@@ -77,7 +77,7 @@ Describe 'Native Clock focus launch' {
 
         $uri = New-FocusSessionUri -EndTime $endTime
 
-        $uri | Should Be 'ms-clock://createfocustimer?skipBreaks=false&displayMode=aot&force=true&endTime=1790698800000'
+        $uri | Should Be 'ms-clock://createfocustimer?skipBreaks=true&displayMode=aot&force=true&endTime=1790698800000'
     }
 
     It 'does not open Clock during WhatIf' {
@@ -100,7 +100,7 @@ Describe 'Native Clock focus launch' {
 
         $result.Started | Should Be $true
         $result.Reason | Should Be 'LaunchRequested'
-        $result.Uri | Should Be 'ms-clock://createfocustimer?skipBreaks=false&displayMode=aot&force=true&endTime=1790698800000'
+        $result.Uri | Should Be 'ms-clock://createfocustimer?skipBreaks=true&displayMode=aot&force=true&endTime=1790698800000'
         Assert-MockCalled Start-Process -Times 1 -Scope It -ParameterFilter { $FilePath -eq $result.Uri }
     }
 
@@ -315,6 +315,34 @@ Describe 'Duplicate run protection' {
     }
 }
 
+Describe 'Focus session continuity' {
+    It 'restarts Focus when it disappears before the fixed end time' {
+        $times = New-Object System.Collections.Queue
+        $times.Enqueue([datetime]'2026-09-29 21:30:00')
+        $times.Enqueue([datetime]'2026-09-29 23:00:00')
+        $clock = { $times.Dequeue() }
+        Mock Test-FocusSessionActive { $false }
+        Mock Start-NativeFocusSession {
+            [pscustomobject]@{ Started = $true; Uri = 'ms-clock://restart'; Reason = 'LaunchRequested' }
+        }
+        Mock Wait-FocusSessionActive { $true }
+        Mock Ensure-DoNotDisturbOff { $true }
+        Mock Start-Sleep { }
+        Mock Write-FocusLog { }
+
+        $exitCode = Maintain-FocusSession -Window 'Evening' -EndTime ([datetime]'2026-09-29 23:00:00') `
+            -GetCurrentTime $clock -PollInterval ([TimeSpan]::FromMilliseconds(1))
+
+        $exitCode | Should Be 0
+        Assert-MockCalled Start-NativeFocusSession -Times 1 -Scope It -ParameterFilter {
+            $EndTime -eq ([datetime]'2026-09-29 23:00:00')
+        }
+        Assert-MockCalled Write-FocusLog -Times 1 -Scope It -ParameterFilter { $Event -eq 'FocusLost' }
+        Assert-MockCalled Write-FocusLog -Times 1 -Scope It -ParameterFilter { $Event -eq 'FocusRestarted' }
+        Assert-MockCalled Write-FocusLog -Times 1 -Scope It -ParameterFilter { $Event -eq 'FocusCompleted' }
+    }
+}
+
 Describe 'Scheduled run orchestration' {
     It 'waits until Windows reports Focus active' {
         $script:focusChecks = 0
@@ -388,14 +416,16 @@ Describe 'Scheduled run orchestration' {
         Invoke-FocusRun -Window 'Afternoon' -Now ([datetime]'2026-09-29 14:00:00') | Should Be 12
     }
 
-    It 'treats an already active Focus session as a safe skip' {
+    It 'keeps guarding an already active Focus session and enforces Do Not Disturb off' {
         Mock Invoke-LogMaintenance { [pscustomobject]@{ Ran = $false; DeletedCount = 0; Reason = 'NotDue' } }
         Mock Start-NativeFocusSession {
             [pscustomobject]@{ Started = $false; Uri = 'ms-clock://test'; Reason = 'FocusAlreadyActive' }
         }
+        Mock Ensure-DoNotDisturbOff { $true }
         Mock Write-FocusLog { }
 
         Invoke-FocusRun -Window 'Afternoon' -Now ([datetime]'2026-09-29 14:00:00') | Should Be 0
+        Assert-MockCalled Ensure-DoNotDisturbOff -Times 1 -Scope It
     }
 
     It 'does not create logs, locks, or Clock requests during WhatIf' {
@@ -446,6 +476,12 @@ Describe 'Scheduled task lifecycle' {
         }
         Assert-MockCalled New-ScheduledTaskTrigger -Times 1 -Scope It -ParameterFilter {
             $Daily -and $At.TimeOfDay -eq ([TimeSpan]::FromHours(21))
+        }
+        Assert-MockCalled New-ScheduledTaskTrigger -Times 2 -Scope It -ParameterFilter {
+            $AtLogOn -and $User -eq ([Security.Principal.WindowsIdentity]::GetCurrent().Name)
+        }
+        Assert-MockCalled Register-ScheduledTask -Times 2 -Scope It -ParameterFilter {
+            @($Trigger).Count -eq 2
         }
         Assert-MockCalled New-ScheduledTaskSettingsSet -Times 2 -Scope It -ParameterFilter {
             $StartWhenAvailable -and -not $WakeToRun -and $MultipleInstances -eq 'IgnoreNew'
@@ -501,6 +537,7 @@ Describe 'Command modes' {
         Mock Start-NativeFocusSession { [pscustomobject]@{ Started = $true; Uri = 'ms-clock://test'; Reason = 'LaunchRequested' } }
         Mock Wait-FocusSessionActive { $true }
         Mock Ensure-DoNotDisturbOff { $true }
+        Mock Maintain-FocusSession { 0 }
         Mock Invoke-LogMaintenance { }
         Mock Write-FocusLog { }
 
@@ -510,6 +547,9 @@ Describe 'Command modes' {
             $EndTime -eq ([datetime]'2026-09-29 12:01:00')
         }
         Assert-MockCalled Ensure-DoNotDisturbOff -Times 1 -Scope It
+        Assert-MockCalled Maintain-FocusSession -Times 1 -Scope It -ParameterFilter {
+            $Window -eq 'Test' -and $EndTime -eq ([datetime]'2026-09-29 12:01:00')
+        }
     }
 
     It 'does not perform a live test during WhatIf' {
